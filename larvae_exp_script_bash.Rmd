@@ -1,0 +1,262 @@
+---
+title: "Larvae experiment script"
+author: "Ruben Martinez"
+date: "2025-10-08"
+output: html_document
+---
+All of the mentioned commands were stored in .sbatch files, and ran with the following settings:
+```{bash}
+#!/bin/bash
+#
+#SBATCH --ntasks=1
+#SBATCH -J whatever_the_pipeline
+#SBATCH -o o_%x_%J.txt
+#SBATCH -e e_%x_%J.txt
+#SBATCH -p gpu_p
+#SBATCH -q gpu_normal
+#SBATCH --cpus-per-task=20
+#SBATCH --gres=gpu:2
+#SBATCH --mem=200G
+#SBATCH -t 24:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=ruben.martinezcuesta@helmholtz-munich.de
+
+source /home/comi/ruben.martinez/tools/apps/mamba/etc/profile.d/conda.sh
+```
+
+Basecalling with Dorado
+```{bash}
+#Running Dorado stored in a common directory
+/lustre/groups/comi/tools/dorado-0.9.5-linux-x64/bin/dorado basecaller hac /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/greenroof_dataset/pod5 --kit-name SQK-RBK114-24 \
+--no-trim \
+--device cuda:0,1 > /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_0425.bam
+```
+
+Demultiplexing with Dorado
+```{bash}
+/lustre/groups/comi/tools/dorado-0.9.5-linux-x64/bin/dorado demux /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_0425.bam \
+--output-dir gr_pool_demux_0425 \
+--no-classify \
+--emit-fastq
+```
+
+Trimming of ONT adapters with Porechop
+```{bash}
+#With Porechop installed as a conda env
+source /lustre/groups/comi/tools/miniconda3/etc/profile.d/conda.sh
+
+conda activate porechop
+
+for file in /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425\*.fastq; do
+  # Extract the base name of the file (without .fastq extension)
+  base_name="${file%.fastq}"
+  
+  # Run Porechop on the file and output to a new file with _trimmed suffix
+  porechop -i "$file" -o "${base_name}_trimmed.fastq" -v 1
+  
+done
+
+mv *_trimmed.fastq /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425\trimmed
+```
+
+Quality filtering with Chopper
+```{bash}
+#With chopper installed in a conda env
+source /lustre/groups/comi/tools/miniconda3/etc/profile.d/conda.sh
+
+conda activate chopper
+
+for file in /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425\trimmed/*.fastq; do
+  #Extract the base name of the file (without .fastq extension)
+ base_name=${file%.fastq}
+
+chopper --quality 10 --minlength 500 --threads 10 -i $file > ${base_name}_filt.fastq
+
+done
+
+mv *_filt.fastq /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425\trimmed/filtered
+
+```
+
+Remove host (E.danica; Edan2.0 assembly from NCBI; GCA_000507165.2) from samples with minimap2
+```{bash}
+source /lustre/groups/comi/tools/miniconda3/etc/profile.d/conda.sh
+
+conda activate minimap2
+
+minimap2 -d e_danica_index.mmi GCA_000507165.2_Edan_2.0_genomic.fna
+
+for file in *_filt.fastq.fastq; do
+  # Extract the base name of the file (without .fastq.gz extension)
+  base_name="${file%trimmed_filt.fastq}"
+  
+  # Run minimap2 and output to a SAM file
+  minimap2 -a -x map-ont -t 4 e_danica_index.mmi "$file" > "${base_name}.sam" 
+done
+```
+
+Filtering out host reads with samtools
+```{bash}
+source /lustre/groups/comi/tools/miniconda3/etc/profile.d/conda.sh
+
+conda activate minimap2
+#samtools was also installed in this conda env
+#conda install samtools -c bioconda
+
+for s in *.sam; do
+    base=$(basename "$s" .sam)
+    samtools view -Sb "$s" | samtools sort -n -o "${base}.bam"
+    samtools fastq -f 4 "${base}.bam" > "${base}_wh.fastq"
+done
+```
+
+Assembly with metaMDBG
+```{bash}
+source /lustre/groups/comi/tools/miniconda3/etc/profile.d/conda.sh
+
+conda activate metamdbg
+
+metaMDBG asm --out-dir metamdbg_OTL1_T1 \
+--threads 10 \
+--in-ont SQK-RBK114-24_barcode01_wh.fastq SQK-RBK114-24_barcode02_wh.fastq SQK-RBK114-24_barcode03_wh.fastq SQK-RBK114-24_barcode04_wh.fastq SQK-RBK114-24_barcode05_wh.fastq SQK-RBK114-24_barcode17_wh.fastq
+```
+
+Polishing the metaMDBG assembly with racon
+```{bash}
+#We need to map the reads to the assembly as a pre-step
+#Number of racon rounds depending on the quality of the assembly --> check with metaQUAST
+srun -p cpu_p -q cpu_normal \
+     --job-name=minimap2 \
+     --cpus-per-task=8 \
+     --mem=32G \
+     --time=06:00:00 \
+bash -c "minimap2 -ax map-ont metamdbg_OTL1_T1/final.contigs.fa reads_OTL1_T1.fastq > map_assembly_OTL1_T1.sam"
+
+srun -p cpu_p -q cpu_normal \
+     --job-name=racon \
+     --cpus-per-task=8 \
+     --mem=32G \
+     --time=06:00:00 \
+bash -c "racon -t 14 -m 8 -x -6 -g -8 -w 500 reads_OTL1_T1.fastq map_assembly_OTL1_T1.sam metamdbg_OTL1_T1/final.contigs.fa > polished_assembly_OTL1_T1_1.fa"
+```
+
+Checking the quality of the assembly with MetaQUAST
+```{bash}
+srun -p cpu_p -q cpu_normal \
+     --job-name=metaquast \
+     --cpus-per-task=8 \
+     --mem=32G \
+     --time=06:00:00 \
+bash -c "metaquast -t 8 -o quast --max-ref-number 0 final.contigs.fa"
+```
+
+```{bash}
+srun -p cpu_p -q cpu_normal \
+  --job-name=minimap2 \
+  --cpus-per-task=8 \
+  --mem=60G \
+  --time=06:00:00 \
+  bash -c "minimap2 -t 8 -ax map-ont megahit_OTL1_T1/polished_assembly_OTL1_T1_2.fa reads_OTL1_ST1.fastq \
+    | samtools view -F 3584 -b \
+    | samtools sort -@ 8 -o map_assembly_racon_OTL1_T1.sorted.bam"
+```
+
+Binning with LRBinner
+```{bash}
+python /home/comi/ruben.martinez/LRBinner/lrbinner.py contigs \
+--reads-path reads_OTL1_T1.fastq \
+--k-size 3 \
+--contigs polished_assembly_OTL1_T1_1.fa \
+--threads 15 \
+--output lrbinner_OTL1_T1 \
+--seed 1234 \ 
+#for reproducibility
+-sep #to split the bins
+```
+
+Binning with VAMB
+```{bash}
+vamb bin default --outdir vamb_OTL1_T1 \
+--fasta polished_assembly_OTL1_T1_1.fa \
+--bamdir map_assembly_OTL1 \
+-m 1000 -o _ \
+--minfasta 20000 \
+--seed 123
+```
+
+Binning with MetaWrap
+```{bash}
+metawrap binning -a polished_assembly_OTL1_T1_1.fa \
+--metabat2 --maxbin2 --concoct \
+-o metawrap_OTL1_T1 \
+--single-end SQK-RBK114-24_barcode01_wh.fastq SQK-RBK114-24_barcode02_wh.fastq SQK-RBK114-24_barcode03_wh.fastq SQK-RBK114-24_barcode04_wh.fastq SQK-RBK114-24_barcode05_wh.fastq SQK-RBK114-24_barcode17_wh.fastq
+```
+
+Purifying the bins with MAGpurify using the output of MetaWrap
+```{bash}
+# Input/output paths
+INPUT_DIR="metawrap_OTL1_T1/metabat2_bins"
+OUT_BASE="metawrap_OTL1_T1/metabat2_bins_magpurify"
+export MAGPURIFYDB=/lustre/groups/comi/tools/databases/MAGpurify-db-v1.0
+
+mkdir -p "$OUT_BASE"
+
+# Number of bins to process in parallel
+THREADS=10  # change this based on your CPU cores
+
+# Function that runs MAGpurify for one bin
+run_magpurify_for_bin() {
+    bin_path="$1"
+    bin_name=$(basename "$bin_path" .fa)
+    outdir="${OUT_BASE}/${bin_name}_magpurify"
+
+    echo "===== Running MAGpurify for ${bin_name} ====="
+    mkdir -p "$outdir"
+
+    magpurify phylo-markers "$bin_path" "$outdir"
+    magpurify clade-markers "$bin_path" "$outdir"
+    magpurify tetra-freq "$bin_path" "$outdir"
+    magpurify gc-content "$bin_path" "$outdir"
+    magpurify coverage "$bin_path" "$outdir" map_assembly_racon_OTL1_T1.sorted.bam
+    magpurify known-contam "$bin_path" "$outdir"
+
+    # Clean bin
+    magpurify clean-bin "$bin_path" "$outdir" "${outdir}/${bin_name}.clean.fa"
+}
+
+export -f run_magpurify_for_bin
+export OUT_BASE
+
+# Run in parallel for all .fa bins
+ls "$INPUT_DIR"/*.fa | parallel -j "$THREADS" run_magpurify_for_bin {}
+```
+
+```{bash}
+find . -name "*.clean.fa" -exec mv {} ../concoct_bins/ \;
+find . -name "*.clean.fa" -exec mv {} ../metabat2_bins/ \;
+find . -name "*.clean.fa" -exec mv {} ../maxbin2_bins/ \;
+```
+
+Check bins' quality with Checkm2
+```{bash}
+checkm2 predict \
+--input metawrap_OTL1_T1 -x .fa \
+--threads 10 \
+--output-directory metawrap_OTL1_T1/checkm2 \
+--database_path /lustre/groups/comi/tools/databases/CheckM2_db/uniref100.KO.1.dmnd
+```
+
+Annotating the bins with DRAM
+```{bash}
+source /lustre/groups/comi/tools/miniconda3/etc/profile.d/conda.sh
+
+conda activate DRAM
+
+DRAM.py annotate \
+  -i 'metawrap_OTL1_T1/*.fa' \
+  -o metawrap_OTL1_T1/DRAM \
+  --min_contig_size 200 \
+  --threads 10 \
+  --use_vogdb
+```
+
