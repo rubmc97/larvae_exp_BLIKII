@@ -9,6 +9,8 @@ This repository contains the code used to process and analyse 16S rRNA amplicon 
 |------|-------------|
 | `larvae_exp_script_bash.Rmd` | R Markdown file containing bash code chunks for preprocessing and pipeline steps, executed via SLURM on an HPC cluster |
 | `16S_analyses_script_BLIK_III.R` | R script to reproduce the full analysis of the 16S rRNA amplicon dataset |
+cluster |
+| `DADA2_larvae.R` | R script to reproduce the DADA2-based processing of the 16S rRNA amplicon dataset |
 
 ## Requirements
 - R (≥ 4.3.1)
@@ -21,4 +23,5 @@ This repository contains the code used to process and analyse 16S rRNA amplicon 
    git clone https://github.com/your-username/your-repo-name.git
 ```
 2. Run the bash pipeline by submitting the chunks in `larvae_exp_script_bash.Rmd` via SLURM.
-3. Reproduce the 16S rRNA amplicon analyses by running `16S_analyses_script_BLIK_III.R` in R.
+3. Reproduce the 16S rRNA amplicon DADA2-based processing by running `DADA2_larvae.R` in R.
+4. Reproduce the 16S rRNA amplicon analyses by running `16S_analyses_script_BLIK_III.R` in R.
